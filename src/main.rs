@@ -68,7 +68,7 @@ fn fcmp(a: f32, b: f32) -> std::cmp::Ordering {
 }
 
 /// A 2-dimensional vector.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct PVec2 {
     pub r: f32,
     pub t: f32,
@@ -87,11 +87,7 @@ impl PVec2 {
     #[inline]
     pub fn from_cart(pos: Vec2) -> PVec2 {
         let r = pos.length();
-        let theta = match fcmp(pos.x, 0.) {
-            Ordering::Less => PI + f32::atan(pos.y / pos.x),
-            Ordering::Equal => 0.,
-            Ordering::Greater => f32::atan(pos.y / pos.x),
-        };
+        let theta = pos.y.atan2(pos.x);
         pvec2(r, theta)
     }
 
@@ -117,7 +113,10 @@ impl Add for PVec2 {
     type Output = Self;
 
     fn add(self, other: Self) -> Self {
-        Self {r: self.r + other.r, t: self.t + other.t}
+        Self {
+            r: self.r + other.r,
+            t: f32::sin(self.t + other.t).atan2(f32::cos(self.t + other.t)),
+        }
     }
 }
 
@@ -125,30 +124,38 @@ impl Sub for PVec2 {
     type Output = Self;
 
     fn sub(self, other: Self) -> Self {
-        Self {r: self.r - other.r, t: f32::min(self.t - other.t, other.t - self.t)}
+        Self {
+            r: self.r - other.r, 
+            t: f32::sin(self.t - other.t).atan2(f32::cos(self.t - other.t)),
+        }
     }
 }
 
 // get polar velocity of cartesian velocity input
 // orbital control equation, outputs a force vector to apply
 // NOTE: currently assumes rhs orbit direction
-fn calc_orbital_control(p: Vec2, v: Vec2, target_p: Vec2, target_v: Vec2) -> Vec2 {
+fn calc_orbital_control(p: Vec2, v: Vec2, target_p: Vec2, target_v: Vec2, debug: bool) -> Vec2 {
     // project inputs into polar coords
     let p_pol = PVec2::from_cart(p);
     let target_p_pol = PVec2::from_cart(target_p);
     let v_pol = PVec2::from_cart_vel(p, v);
     let target_v_pol = PVec2::from_cart_vel(target_p, target_v);
 
-    let delta_p_pol = target_p_pol - p_pol;
-    let delta_v_pol = target_v_pol - v_pol;
+    let delta_p = target_p_pol - p_pol;
+    let delta_v = target_v_pol - v_pol;
+
+    if debug {
+        println!("p_pol: {:?}", p_pol);
+        println!("target_p_pol: {:?}", target_p_pol);
+        println!("v_pol: {:?}", v_pol);
+        println!("target_v_pol: {:?}", target_v_pol);
+        println!("delta_p: {:?}", delta_p);
+        println!("delta_v: {:?}", delta_v);
+    }
 
     // Simple PD controller, no integral term to keep stateless
-    let control_f_pol = pvec2(
-        delta_p_pol.r - delta_v_pol.r,
-        delta_p_pol.t - delta_v_pol.t);
-
-    // project back to cartesion control_v
-    control_f_pol.to_cart_vel(p_pol)
+    let control_f = pvec2(0.1 * delta_p.r + 0.9 * delta_v.r, 0.07 * delta_p.t + 0.9 * delta_v.t);
+    control_f.to_cart_vel(p_pol)
 }
 
 #[macroquad::main("jspace")]
@@ -185,24 +192,21 @@ async fn main() {
     let player_idx = 0;
 
     // ENEMIES
-    {
-        let player_pos = ships[player_idx].pos;
-        ships.extend((0..1).map(|i| {
-            let pos = player_pos + vec2(1.0, 2.0);
-            Ship {
-                pos,
-                vel: calc_orbital_speed(pos, sun),
-                dir: Vec2::X,
-                capacity: 100.,
-                fuel: 1000.,
-                pressure: 500.,
-                temp: 100.0,
-                mass: 1.0,
-                size: 0.2,
-                color: RED,
-            }
-        }));
-    }
+    ships.extend((0..2).map(|i| {
+        let pos = rand_initial_pos(sun);
+        Ship {
+            pos,
+            vel: calc_orbital_speed(pos, sun),
+            dir: Vec2::X,
+            capacity: 100.,
+            fuel: 1000.,
+            pressure: 500.,
+            temp: 100.0,
+            mass: 1.0,
+            size: 0.2,
+            color: RED,
+        }
+    }));
 
     // ITEMS
     for _i in 0..1000 {
@@ -245,13 +249,31 @@ async fn main() {
         let input_force = Vec2::from_angle(input_angle).rotate(input_mag);
 
         // SHIP CONTROL
-        ships[player_idx].dir = input_dir;
-        ships[player_idx].vel += input_force.normalize_or_zero() * DT;
+        // ships[player_idx].dir = input_dir;
+        // ships[player_idx].vel += input_force.normalize_or_zero() * ENGINE * DT;
 
-        let tp = ships[player_idx].pos;
-        let tv = ships[player_idx].vel;
-        ships.par_iter_mut().skip(1).for_each(|ship| {
-            let control_force = calc_orbital_control(ship.pos, ship.vel, tp, tv);
+        let player_p = ships[player_idx].pos;
+        let player_v = ships[player_idx].vel;
+        ships.par_iter_mut().enumerate().for_each(|(idx, ship)| {
+            let target_p: Vec2;
+            let target_v: Vec2;
+            if ship.capacity >= 500. {
+                let target_idx = idx % planets.len();
+                target_p = planets[target_idx].pos;
+                target_v = planets[target_idx].vel;
+                if idx == 0 {
+                    println!("target: planet at: {:?}", target_p);
+                }
+            } else {
+                let target_idx = idx % dust.len();
+                target_p = dust[target_idx].xy();
+                target_v = dust[target_idx].zw();
+               
+                if idx == 0 {
+                    println!("target: asteroid at: {:?}", target_p);
+                }
+            }
+            let control_force = calc_orbital_control(ship.pos, ship.vel, target_p, target_v, (idx == 0));
             if control_force == Vec2::ZERO { panic!("control force was zero"); }
             ship.dir = control_force.normalize();
             ship.vel += control_force * ENGINE * DT;
@@ -282,7 +304,8 @@ async fn main() {
             for planet in planets.iter() {
                 let dist = candidate_pos.distance(planet.pos);
                 if dist <= planet.size / 2. {
-                    ship.fuel = 500.0;
+                    ship.fuel = 500.;
+                    ship.capacity = 0.;
                     ship.vel = planet.vel;
                 }
             }

@@ -232,6 +232,7 @@ name = "jspace"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "crossbeam-channel",
  "macroquad",
  "rayon",
 ]

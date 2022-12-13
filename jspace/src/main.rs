@@ -1,4 +1,4 @@
-use log::{debug, info, trace};
+use log::{info, trace};
 use macroquad::input::KeyCode::*;
 use macroquad::prelude::*;
 use nanoserde::{DeRon, SerRon};
@@ -9,6 +9,7 @@ use std::{
 };
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumCount, EnumIter, EnumString, EnumVariantNames, IntoStaticStr};
+use rayon::prelude::*;
 
 macro_rules! i {
     ($var: ident) => {
@@ -59,7 +60,31 @@ fn draw_info_line(anchor: &mut Vec2, text: &str) {
     draw_text(text, anchor.x, anchor.y, font_size, GREEN);
 }
 
+fn draw_target(camera: &Camera3D, p: Vec2) {
+    let params = DrawTextureParams {
+            dest_size: None,
+            source: None,
+            rotation: 0.,
+            pivot: None,
+            flip_x: false,
+            flip_y: true,
+        };
+    draw_texture_ex(camera.render_target.unwrap().texture, p.x, p.y, WHITE, params);
+}
 // ------------------------------------------------------------------------------------------------
+
+const KEY_BINDS: [(KeyCode, &'static str); 10] = [
+    (Key0, "0"),
+    (Key1, "1"),
+    (Key2, "2"),
+    (Key3, "3"),
+    (Key4, "4"),
+    (Key5, "5"),
+    (Key6, "6"),
+    (Key7, "7"),
+    (Key8, "8"),
+    (Key9, "9"),
+];
 
 #[derive(SerRon, DeRon, Default)]
 struct Ship {
@@ -111,19 +136,32 @@ impl Dir {
     }
 }
 
-#[derive(Clone, SerRon, DeRon, Default)]
-struct Circuit {
-    dir: Dir,
-    v: f32,
-    i: f32,
-    r: f32,
-    q: f32,
-    c: f32,
-    l: f32,
+#[derive(
+    Default,
+    Debug,
+    SerRon,
+    DeRon,
+    Display,
+    EnumString,
+    EnumCount,
+    EnumIter,
+    EnumVariantNames,
+    IntoStaticStr,
+    PartialEq,
+    Eq,
+    Clone,
+)]
+enum Circuit {
+    #[default]
+    None,
+    Wire,
+    Head,
+    Tail
 }
 
 #[derive(
     Default,
+    Debug,
     SerRon,
     DeRon,
     Display,
@@ -139,12 +177,9 @@ enum ShipTile {
     Ground,
     Wall,
     CenterOfMass,
-    Engine(Dir),
-    Pipe(Circuit),
-    Valve(Circuit),
-    Actuator(Circuit),
-    Tank(Circuit),
-    Pump(Circuit),
+    Engine(Dir, bool),
+    Wire,
+    Input(usize),
 }
 
 #[derive(
@@ -169,13 +204,53 @@ enum Terrain {
     },
 }
 
-#[macroquad::main("jspace")]
+fn to_screen(p: Vec3, camera: &Camera3D) -> Vec2 {
+    t!(p);
+    let coord = camera.matrix().project_point3(p).xy() * vec2(1.0, -1.0);
+    t!(coord);
+    let window = vec2(screen_width(), screen_height());
+    let res = coord * window / 2. + window / 2.;
+    t!(res);
+    res 
+}
+
+/// Initial circuit state from a grid
+fn init_circuit(grid: &Vec<Vec<ShipTile>>) -> Vec<Vec<Circuit>> {
+    let mut state = vec![vec![Circuit::None; grid.len()]; grid.len()];
+    for (x, col) in grid.iter().enumerate() {
+        for (y, tile) in col.iter().enumerate() {
+            state[x][y] = match tile {
+                ShipTile::Wire | ShipTile::Input(_) => Circuit::Wire,
+                _ => Circuit::None,
+            };
+        }
+    }
+    state
+}
+
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "jspace".to_owned(),
+        fullscreen: false,
+        window_width: 1920,
+        window_height: 1080,
+        window_resizable: false,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() {
     env_logger::init();
 
     // CONFIGURATIONS
-    let scroll_sens = 0.001;
+    let scroll_sens = 0.1;
     let pan_sens: f32 = 0.1;
+
+    // MODELS
+    let ship_vox = dot_vox::load("data/models/cargo-spaceship-by-fps-agency.vox").unwrap();
+    i!(ship_vox);
+    let ship_model_transform = Mat4::IDENTITY;
 
     // EDITOR ELEMENTS
     let mut ship_files: Vec<_> = fs::read_dir("data/ships")
@@ -194,7 +269,6 @@ async fn main() {
             .cmp(&b.as_path().to_str().unwrap().to_lowercase())
     });
 
-    println!("{:?}", ship_files);
     let hotload_ship = |idx: usize| {
         let grid: Vec<Vec<ShipTile>> = DeRon::deserialize_ron(
             fs::read_to_string(ship_files[idx].as_path())
@@ -205,11 +279,12 @@ async fn main() {
         grid
     };
     let mut tile_type_iter = ShipTile::iter().skip(1).cycle(); // loop through enum types, but skip
-                                                               // Ground
+    let mut grid = hotload_ship(0);
+    let mut circuit_state_a = init_circuit(&grid);
+    let mut circuit_state_b = circuit_state_a.clone();
 
     // WORLD ELEMENTS
-    let mut grid = hotload_ship(0);
-    let ship = Ship::default();
+    let mut ship = Ship::default();
     let map = Vec::<Terrain>::new();
 
     // INPUT ELEMENTS
@@ -219,16 +294,29 @@ async fn main() {
     let mut new_tile_type: ShipTile = tile_type_iter.next().unwrap();
     let mut selected_tile: Option<(usize, usize)> = None;
 
+    let mut keybind_idx = 0;
+    let mut state_count = 0;
+
+
     loop {
         // PREPARE FRAME
         clear_background(DARKGRAY);
-        let camera = Camera3D {
+        let editor_camera = Camera3D {
             position: vec3(pos.x, -15. * zoom, pos.y),
             up: UP,
             target: vec3(pos.x, 0., pos.y + 1.0),
+            render_target: Some(render_target(screen_width() as u32 / 2, screen_height() as u32 / 2)),
             ..Default::default()
         };
-        set_camera(&camera);
+        let world_camera = Camera3D {
+            position: vec3(pos.x, -5. * zoom, pos.y),
+            up: UP,
+            target: vec3(pos.x + 5., 0., pos.y + 5.),
+            render_target: Some(render_target(screen_width() as u32 / 2, screen_height() as u32 / 2)),
+            ..Default::default()
+        };
+
+        set_camera(&editor_camera);
 
         // USER INPUT
         let mouse_world: Vec2 = {
@@ -236,16 +324,15 @@ async fn main() {
             let clip = (mouse_position_local() * vec2(1.0, -1.0))
                 .extend(-1.0)
                 .extend(1.0);
-            let eye = (camera.proj().inverse() * clip)
+            let eye = (editor_camera.proj().inverse() * clip)
                 .xy()
                 .extend(-1.0)
                 .extend(0.0);
-            let ray = (camera.view().inverse() * eye).xyz().normalize();
+            let ray = (editor_camera.view().inverse() * eye).xyz().normalize();
 
-            let distance_to_ground = -camera.position.dot(UP) / (ray.dot(UP));
-            (camera.position + ray * distance_to_ground).xz()
+            let distance_to_ground = -editor_camera.position.dot(UP) / (ray.dot(UP));
+            (editor_camera.position + ray * distance_to_ground).xz()
         };
-        d!(mouse_world);
         draw_sphere(p3d(mouse_world), 0.1, None, GREEN);
 
         let mouse_grid: Option<(usize, usize)> = {
@@ -260,7 +347,6 @@ async fn main() {
                 None
             }
         };
-        d!(mouse_grid);
         if let Some(mouse_grid) = mouse_grid {
             draw_sphere(g3d(mouse_grid), 0.1, None, BLUE);
         }
@@ -288,10 +374,19 @@ async fn main() {
         // INPUT SHIP EDITOR
         if let Some((x, y)) = mouse_grid {
             if is_mouse_button_down(MouseButton::Left) {
-                grid[x][y] = new_tile_type.clone();
+                grid[x][y] = match new_tile_type {
+                    ShipTile::Input(_) => {
+                        let new = ShipTile::Input(keybind_idx);
+                        keybind_idx = (keybind_idx + 1) % KEY_BINDS.len();
+                        new
+                    }
+                    _ => new_tile_type.clone(),
+                };
+                circuit_state_a = init_circuit(&grid);
             }
             if is_mouse_button_down(MouseButton::Right) {
                 grid[x][y] = ShipTile::Ground;
+                circuit_state_a = init_circuit(&grid);
             }
         }
 
@@ -301,60 +396,102 @@ async fn main() {
             let mut file = File::create(ship_files[active_ship_file].as_path()).unwrap();
             file.write_all(SerRon::serialize_ron(&grid).as_bytes())
                 .unwrap();
+
+            // RELOAD TO ensure synced
+            grid = hotload_ship(active_ship_file);
+            circuit_state_a = init_circuit(&grid);
         }
 
         if is_key_pressed(L) {
             active_ship_file = (active_ship_file + 1) % ship_files.len();
             grid = hotload_ship(active_ship_file);
+            circuit_state_a = init_circuit(&grid);
         }
 
         if is_key_pressed(Tab) {
             new_tile_type = tile_type_iter.next().unwrap();
         }
-
         if is_key_pressed(E) {
             selected_tile = mouse_grid;
         }
         if is_key_released(E) {
             selected_tile = None;
         }
+
         if let Some((x, y)) = selected_tile {
             let dir = Dir::from_vec2(mouse_world - vec2(x as f32, y as f32));
-            t!(dir);
 
             match grid[x][y].clone() {
-                ShipTile::Engine(_) => grid[x][y] = ShipTile::Engine(dir),
-                ShipTile::Pipe(circuit) => {
-                    grid[x][y] = {
-                        let mut new_circuit = circuit.clone();
-                        new_circuit.dir = dir;
-                        ShipTile::Pipe(new_circuit)
-                    }
-                }
-                ShipTile::Valve(circuit) => {
-                    grid[x][y] = {
-                        let mut new_circuit = circuit.clone();
-                        new_circuit.dir = dir;
-                        ShipTile::Valve(new_circuit)
-                    }
-                }
-                ShipTile::Actuator(circuit) => {
-                    grid[x][y] = {
-                        let mut new_circuit = circuit.clone();
-                        new_circuit.dir = dir;
-                        ShipTile::Actuator(new_circuit)
-                    }
-                }
-                ShipTile::Tank(circuit) => {
-                    grid[x][y] = {
-                        let mut new_circuit = circuit.clone();
-                        new_circuit.dir = dir;
-                        ShipTile::Actuator(new_circuit)
-                    }
-                }
+                ShipTile::Engine(_, bool) => grid[x][y] = ShipTile::Engine(dir, bool),
                 _ => (),
             }
         }
+
+        // UPDATE SHIP
+        for (x, col) in grid.iter_mut().enumerate() {
+            for (y, tile) in col.iter_mut().enumerate() {
+                match tile {
+                    ShipTile::Engine(dir, _) => {
+                        let v = dir.v(); 
+                        let xb = x as isize - v.x as isize;
+                        let yb = y as isize - v.y as isize;
+                        let bounds = circuit_state_a.len() as isize;
+                        if xb > 0 && xb < bounds && yb > 0 && yb < bounds {
+                            if circuit_state_a[xb as usize][yb as usize] == Circuit::Head {
+                                circuit_state_a[xb as usize][yb as usize] = Circuit::Tail;
+                                ship.f += v;
+                                *tile = ShipTile::Engine(dir.clone(), true);
+                            } else {
+                                *tile = ShipTile::Engine(dir.clone(), false);
+                            }
+                        }
+                    },
+
+                    ShipTile::Input(key_idx) => if is_key_down(KEY_BINDS[*key_idx].0) && circuit_state_a[x][y] == Circuit::Wire {
+                        circuit_state_a[x][y] = Circuit::Head;
+                    },
+                    _ => (),
+                }
+            }
+        }
+
+        // SIMULATE CIRCUIT 
+        if state_count == 0 {
+            circuit_state_b = circuit_state_a.clone();
+            for x in 0..circuit_state_b.len() {
+                for y in 0..circuit_state_b[0].len() {
+                    circuit_state_a[x][y] = match circuit_state_b[x][y] {
+                        Circuit::None => Circuit::None,
+                        Circuit::Wire => {
+                            let mut count = 0;
+                            for ix in -1..(2 as isize) {
+                                let xn = x as isize + ix;
+                                if xn > 0 && xn < circuit_state_b.len() as isize {
+                                    let col = &circuit_state_b[xn as usize];
+                                    for iy in -1..(2 as isize) {
+                                        let yn = y as isize + iy;
+                                        if yn > 0 && yn < circuit_state_b[0].len() as isize {
+                                            if col[yn as usize] == Circuit::Head {
+                                                count += 1;
+                                            }
+
+                                        }
+                                    }
+                                }
+                            }
+                            if count == 1 {
+                                Circuit::Head
+                            } else {
+                                Circuit::Wire
+                            }
+                        }
+                        Circuit::Head => Circuit::Tail,
+                        Circuit::Tail => Circuit::Wire,
+                    };
+                }
+            }
+        }
+        state_count = (state_count + 1) % 5;
 
         // DRAW EDITOR
         draw_grid(GRID_SLICES as u32, GRID_SCALE, BLACK, GRAY);
@@ -368,12 +505,19 @@ async fn main() {
             for (y, tile) in col.iter().enumerate() {
                 let p = g3d((x, y)) + GRID_OFFSET * UP;
                 let sz = Vec3::splat(GRID_SCALE);
+                let color = match circuit_state_b[x][y] {
+                    Circuit::None => GRAY,
+                    Circuit::Wire => YELLOW,
+                    Circuit::Head => RED,
+                    Circuit::Tail => BLUE,
+                };
+
 
                 match tile {
                     ShipTile::Ground => (),
                     ShipTile::Wall => draw_cube(p, sz, None, GRAY),
                     ShipTile::CenterOfMass => draw_cube(p, sz, None, RED),
-                    ShipTile::Engine(dir) => {
+                    ShipTile::Engine(dir, on) => {
                         draw_cube(p, sz / 2., None, ORANGE);
                         draw_sphere(
                             p + p3d(dir.v()) * GRID_SCALE / 4.,
@@ -381,46 +525,33 @@ async fn main() {
                             None,
                             ORANGE,
                         );
+
+                        if *on {
+                            draw_sphere(p + p3d(dir.v()) * GRID_SCALE, GRID_SCALE / 8., None, ORANGE);
+                            draw_sphere(p + p3d(dir.v()) * 2. * GRID_SCALE, GRID_SCALE / 12., None, ORANGE);
+                            draw_sphere(p + p3d(dir.v()) * 3. * GRID_SCALE, GRID_SCALE / 16., None, ORANGE);
+                        }
                     }
-                    ShipTile::Pipe(circuit) => {
-                        let dir = p3d(circuit.dir.v() * GRID_SCALE / 4.);
-                        draw_cube(p, sz / 8., None, BLUE);
-                        draw_cube(p + dir, sz / 8., None, BLUE);
-                        draw_cube(p - dir, sz / 8., None, BLUE);
+                    ShipTile::Wire => {
+                        draw_cube(p, sz / 4., None, color);
                     }
-                    ShipTile::Valve(circuit) => {
-                        let dir = p3d(circuit.dir.v() * GRID_SCALE / 4.);
-                        draw_cube(p, sz / 4., None, BLUE);
-                        draw_cube(p + dir, sz / 8., None, BLUE);
-                        draw_cube(p - dir, sz / 8., None, BLUE);
-                    }
-                    ShipTile::Actuator(circuit) => {
-                        let color = Color {
-                            r: circuit.v,
-                            g: circuit.v,
-                            b: 1.0,
-                            a: 1.0,
-                        };
-                        draw_cube(p, sz / 2., None, color);
-                    }
-                    ShipTile::Tank(circuit) => {
-                        let fill = vec3(1.0, circuit.q / circuit.c * circuit.v, 1.0);
-                        draw_cube(p, sz * fill / 2., None, BLUE);
-                        draw_cube_wires(p, sz / 2., BLUE);
-                    }
-                    ShipTile::Pump(circuit) => {
-                        let dir = p3d(circuit.dir.v() * GRID_SCALE / 4.);
-                        draw_cube(p, sz / 8., None, BLUE);
-                        draw_cube(p + dir, sz / 4., None, BLUE);
-                        draw_cube(p - dir, sz / 8., None, BLUE);
+                    ShipTile::Input(key_idx) => {
+                        let screen_p = to_screen(p, &editor_camera);
+                        draw_cube(p, sz / 4., None, color);
                     }
                 }
             }
         }
 
+        // DRAW WORLD
+        set_camera(&world_camera);
+        draw_grid(GRID_SLICES as u32, GRID_SCALE, BLACK, GRAY);
+
         // DRAW UI
         set_default_camera();
         {
+            draw_target(&editor_camera, vec2(screen_width() / 2., 0.)); 
+            draw_target(&world_camera, vec2(0., screen_height() / 2.)); 
             let mut anchor = Vec2::ZERO;
             draw_info_line(&mut anchor, format!("fps: {}", get_fps()).as_str());
             let ship_name = ship_files[active_ship_file].as_path().display();

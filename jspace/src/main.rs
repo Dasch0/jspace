@@ -71,6 +71,7 @@ fn draw_target(camera: &Camera3D, p: Vec2) {
         };
     draw_texture_ex(camera.render_target.unwrap().texture, p.x, p.y, WHITE, params);
 }
+
 // ------------------------------------------------------------------------------------------------
 
 const KEY_BINDS: [(KeyCode, &'static str); 10] = [
@@ -250,7 +251,6 @@ async fn main() {
     // MODELS
     let ship_vox = dot_vox::load("data/models/cargo-spaceship-by-fps-agency.vox").unwrap();
     i!(ship_vox);
-    let ship_model_transform = Mat4::IDENTITY;
 
     // EDITOR ELEMENTS
     let mut ship_files: Vec<_> = fs::read_dir("data/ships")
@@ -309,10 +309,10 @@ async fn main() {
             ..Default::default()
         };
         let world_camera = Camera3D {
-            position: vec3(pos.x, -5. * zoom, pos.y),
+            position: vec3(pos.x, -50. * zoom, pos.y),
             up: UP,
             target: vec3(pos.x + 5., 0., pos.y + 5.),
-            render_target: Some(render_target(screen_width() as u32 / 2, screen_height() as u32 / 2)),
+            render_target: Some(render_target(screen_width() as u32, screen_height() as u32)),
             ..Default::default()
         };
 
@@ -545,13 +545,33 @@ async fn main() {
 
         // DRAW WORLD
         set_camera(&world_camera);
+        let gl = unsafe { get_internal_gl().quad_gl };
         draw_grid(GRID_SLICES as u32, GRID_SCALE, BLACK, GRAY);
+        let scale = vec3(0.1, -0.1, 0.1);
+        let rotation = Quat::from_axis_angle(UP, 90.);
+        let translation = vec3(100., 0., 100.);
+        let ship_model_transform = Mat4::from_scale_rotation_translation(scale, rotation, translation);
+        gl.push_model_matrix(ship_model_transform);
+        let mut t = 0.0;
+        for model in ship_vox.models.iter() {
+            let component_transform = Mat4::from_translation(vec3(t,0.,0.));
+            gl.push_model_matrix(component_transform);
+            for voxel in model.voxels.iter() {
+                let p = vec3(voxel.x as f32, voxel.y as f32, voxel.z as f32);
+                let sz = vec3(1.1, 1.1, 1.1);
+                let c = &ship_vox.palette[voxel.i as usize];
+                draw_cube(p, sz, None, Color::from_rgba(c.r, c.g, c.b, 254));
+            }
+            t += 50.;
+            gl.pop_model_matrix();
+        }
+        gl.pop_model_matrix();
 
         // DRAW UI
         set_default_camera();
         {
             draw_target(&editor_camera, vec2(screen_width() / 2., 0.)); 
-            draw_target(&world_camera, vec2(0., screen_height() / 2.)); 
+            draw_target(&world_camera, vec2(0., 0.)); 
             let mut anchor = Vec2::ZERO;
             draw_info_line(&mut anchor, format!("fps: {}", get_fps()).as_str());
             let ship_name = ship_files[active_ship_file].as_path().display();

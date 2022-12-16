@@ -281,7 +281,7 @@ impl MagicSnapshotter {
     }
 }
 
-struct GlState {
+pub struct GlState {
     texture: Texture,
     draw_mode: DrawMode,
     clip: Option<(i32, i32, i32, i32)>,
@@ -298,7 +298,7 @@ struct GlState {
 }
 
 impl GlState {
-    fn model(&self) -> glam::Mat4 {
+    pub fn model(&self) -> glam::Mat4 {
         *self.model_stack.last().unwrap()
     }
 }
@@ -537,14 +537,14 @@ pub struct QuadGl {
     pipelines: PipelinesStorage,
 
     draw_calls: Vec<DrawCall>,
-    draw_calls_bindings: Vec<Bindings>,
-    draw_calls_count: usize,
-    state: GlState,
-    start_time: f64,
+    pub draw_calls_bindings: Vec<Bindings>,
+    pub draw_calls_count: usize,
+    pub state: GlState,
+    pub start_time: f64,
 
-    white_texture: Texture,
-    max_vertices: usize,
-    max_indices: usize,
+    pub white_texture: Texture,
+    pub max_vertices: usize,
+    pub max_indices: usize,
 }
 
 impl QuadGl {
@@ -561,7 +561,7 @@ impl QuadGl {
                 draw_mode: DrawMode::Triangles,
                 pipeline: None,
                 break_batching: false,
-                depth_test_enable: false,
+                depth_test_enable: true,
                 snapshotter: MagicSnapshotter::new(ctx),
                 render_pass: None,
                 capture: false,
@@ -822,6 +822,95 @@ impl QuadGl {
 
     pub fn draw_mode(&mut self, mode: DrawMode) {
         self.state.draw_mode = mode;
+    }
+
+    pub fn geometry_face(
+        &mut self,
+        vertices: &[impl Into<VertexInterop> + Copy],
+        indices_lists: &[Vec<u16>],
+    ) {
+        let num_indices: usize = indices_lists.iter().map(|v| v.len()).sum();
+        if vertices.len() >= self.max_vertices || num_indices >= self.max_indices {
+            warn!("geometry() exceeded max drawcall size, clamping");
+        }
+
+        let vertices = &vertices[0..self.max_vertices.min(vertices.len())];
+
+        let pip = self.state.pipeline.unwrap_or(
+            self.pipelines
+                .get(self.state.draw_mode, self.state.depth_test_enable),
+        );
+
+        let previous_dc_ix = if self.draw_calls_count == 0 {
+            None
+        } else {
+            Some(self.draw_calls_count - 1)
+        };
+        let previous_dc = previous_dc_ix.and_then(|ix| self.draw_calls.get(ix));
+
+        if previous_dc.map_or(true, |draw_call| {
+            draw_call.texture != self.state.texture
+                || draw_call.clip != self.state.clip
+                || draw_call.viewport != self.state.viewport
+                || draw_call.model != self.state.model()
+                || draw_call.pipeline != pip
+                || draw_call.render_pass != self.state.render_pass
+                || draw_call.draw_mode != self.state.draw_mode
+                || draw_call.vertices_count >= self.max_vertices - vertices.len()
+                || draw_call.indices_count >= self.max_indices - num_indices
+                || draw_call.capture != self.state.capture
+                || self.state.break_batching
+        }) {
+            let uniforms = self.state.pipeline.map_or(None, |pipeline| {
+                Some(
+                    self.pipelines
+                        .get_quad_pipeline_mut(pipeline)
+                        .uniforms_data
+                        .clone(),
+                )
+            });
+
+            if self.draw_calls_count >= self.draw_calls.len() {
+                self.draw_calls.push(DrawCall::new(
+                    self.state.texture,
+                    self.state.model(),
+                    self.state.draw_mode,
+                    pip,
+                    uniforms.clone(),
+                    self.state.render_pass,
+                    self.max_vertices,
+                    self.max_indices,
+                ));
+            }
+            self.draw_calls[self.draw_calls_count].texture = self.state.texture;
+            self.draw_calls[self.draw_calls_count].uniforms = uniforms;
+            self.draw_calls[self.draw_calls_count].vertices_count = 0;
+            self.draw_calls[self.draw_calls_count].indices_count = 0;
+            self.draw_calls[self.draw_calls_count].clip = self.state.clip;
+            self.draw_calls[self.draw_calls_count].viewport = self.state.viewport;
+            self.draw_calls[self.draw_calls_count].model = self.state.model();
+            self.draw_calls[self.draw_calls_count].pipeline = pip;
+            self.draw_calls[self.draw_calls_count].render_pass = self.state.render_pass;
+            self.draw_calls[self.draw_calls_count].capture = self.state.capture;
+
+            self.draw_calls_count += 1;
+            self.state.break_batching = false;
+        };
+        let dc = &mut self.draw_calls[self.draw_calls_count - 1];
+
+        for i in 0..vertices.len() {
+            dc.vertices[dc.vertices_count + i] = vertices[i].into().into();
+        }
+
+        for indices in indices_lists {
+            for i in 0..indices.len() {
+                dc.indices[dc.indices_count + i] = indices[i] + dc.vertices_count as u16;
+            }
+            dc.indices_count += indices.len();
+        }
+
+        dc.vertices_count += vertices.len();
+        dc.texture = self.state.texture;
     }
 
     pub fn geometry(&mut self, vertices: &[impl Into<VertexInterop> + Copy], indices: &[u16]) {

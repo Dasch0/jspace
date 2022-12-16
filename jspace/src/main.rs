@@ -1,15 +1,52 @@
-use log::{info, trace};
+use dot_vox::{Rotation, SceneNode};
+use macroquad::experimental::collections::storage;
 use macroquad::input::KeyCode::*;
+use macroquad::models::Vertex;
 use macroquad::prelude::*;
+use macroquad::window::miniquad::*;
 use nanoserde::{DeRon, SerRon};
 use std::{
+    collections::{HashSet, VecDeque},
     f32::consts::PI,
     fs::{self, File},
     io::prelude::*,
 };
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumCount, EnumIter, EnumString, EnumVariantNames, IntoStaticStr};
-use rayon::prelude::*;
+
+const VERTEX: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1);
+    uv = texcoord;
+    color = color0 / 255.0;
+}"#;
+
+const FRAGMENT: &str = r#"#version 100
+varying lowp vec2 uv;
+varying lowp vec4 color;
+uniform sampler2D Texture;
+uniform lowp vec3 face_normal;
+void main() {
+    lowp vec3 lightPos = vec3(100.0, -100.0, 100.0);
+    lowp vec3 lightColor = vec3(0.8, 0.8, 1.0);
+    lowp float ambientStrength = 0.5;
+    lowp vec3 ambient = ambientStrength * lightColor;
+    lowp vec3 norm = normalize(face_normal);
+    lowp vec3 lightDir = normalize(lightPos - gl_FragCoord.xyz);  
+    lowp float diff = max(dot(norm, lightDir), 0.0);
+    lowp vec3 diffuse = diff * lightColor;
+    lowp vec4 lighting = vec4((ambient + diffuse), 1.0);
+    gl_FragColor = lighting * color * texture2D(Texture, uv);
+}"#;
 
 macro_rules! i {
     ($var: ident) => {
@@ -62,14 +99,273 @@ fn draw_info_line(anchor: &mut Vec2, text: &str) {
 
 fn draw_target(camera: &Camera3D, p: Vec2) {
     let params = DrawTextureParams {
-            dest_size: None,
-            source: None,
-            rotation: 0.,
-            pivot: None,
-            flip_x: false,
-            flip_y: true,
+        dest_size: None,
+        source: None,
+        rotation: 0.,
+        pivot: None,
+        flip_x: false,
+        flip_y: true,
+    };
+    draw_texture_ex(
+        camera.render_target.unwrap().texture,
+        p.x,
+        p.y,
+        WHITE,
+        params,
+    );
+}
+
+fn map_voxels(voxels: &[dot_vox::Voxel]) -> HashSet<(u8, u8, u8)> {
+    let mut lut = HashSet::new();
+    for v in voxels {
+        lut.insert((v.x, v.y, v.z));
+    }
+    lut
+}
+
+// NOTE: For no good reason in particular, currently 'Front' is +Z, 'Top' is +Y, and 'Right' is +X
+// in 'voxel space'
+const FRONT: usize = 0;
+const BACK: usize = 1;
+const TOP: usize = 2;
+const BOTTOM: usize = 3;
+const LEFT: usize = 4;
+const RIGHT: usize = 5;
+
+#[derive(Debug, Clone)]
+pub struct FaceMesh {
+    pub vertices: Vec<macroquad::models::Vertex>,
+    pub indices: [Vec<u16>; 6],
+}
+
+fn gen_mesh(voxels: &[dot_vox::Voxel], palette: &[dot_vox::Color]) -> Vec<FaceMesh> {
+    let neighbor_lut = map_voxels(voxels);
+    let mut meshes = Vec::new();
+
+    for voxel_slice in voxels.chunks(512) {
+        let mut mesh = FaceMesh {
+            vertices: Vec::with_capacity(voxels.len()),
+            indices: [0; 6].map(|_| Vec::with_capacity(voxels.len())),
         };
-    draw_texture_ex(camera.render_target.unwrap().texture, p.x, p.y, WHITE, params);
+
+        for v in voxel_slice {
+            let c = palette[v.i as usize];
+            let color = Color::from_rgba(c.r, c.g, c.b, c.a);
+            let x = v.x as f32;
+            let y = v.y as f32;
+            let z = v.z as f32;
+
+            let visible_front = match v.z {
+                u8::MAX => true,
+                _ => neighbor_lut.get(&(v.x, v.y, v.z + 1)).is_none(),
+            };
+            let visible_back = match v.z {
+                u8::MIN => true,
+                _ => neighbor_lut.get(&(v.x, v.y, v.z - 1)).is_none(),
+            };
+            let visible_top = match v.y {
+                u8::MAX => true,
+                _ => neighbor_lut.get(&(v.x, v.y + 1, v.z)).is_none(),
+            };
+            let visible_bottom = match v.y {
+                u8::MIN => true,
+                _ => neighbor_lut.get(&(v.x, v.y - 1, v.z)).is_none(),
+            };
+            let visible_left = match v.x {
+                u8::MIN => true,
+                _ => neighbor_lut.get(&(v.x - 1, v.y, v.z)).is_none(),
+            };
+            let visible_right = match v.x {
+                u8::MAX => true,
+                _ => neighbor_lut.get(&(v.x + 1, v.y, v.z)).is_none(),
+            };
+
+            // front vertices (bl, br, tr, tl)
+            let fbl = mesh.vertices.len() as u16;
+            if visible_front || visible_bottom || visible_left {
+                mesh.vertices
+                    .push(Vertex::new(x - 0.5, y - 0.5, z + 0.5, 0., 0., color));
+            }
+
+            let fbr = mesh.vertices.len() as u16;
+            if visible_front || visible_bottom || visible_right {
+                mesh.vertices
+                    .push(Vertex::new(x + 0.5, y - 0.5, z + 0.5, 1., 0., color));
+            }
+
+            let ftr = mesh.vertices.len() as u16;
+            if visible_front || visible_top || visible_right {
+                mesh.vertices
+                    .push(Vertex::new(x + 0.5, y + 0.5, z + 0.5, 1., 1., color));
+            }
+
+            let ftl = mesh.vertices.len() as u16;
+            if visible_front || visible_top || visible_left {
+                mesh.vertices
+                    .push(Vertex::new(x - 0.5, y + 0.5, z + 0.5, 0., 1., color));
+            }
+
+            let bbl = mesh.vertices.len() as u16;
+            if visible_back || visible_bottom || visible_left {
+                mesh.vertices
+                    .push(Vertex::new(x - 0.5, y - 0.5, z - 0.5, 0., 0., color));
+            }
+
+            let bbr = mesh.vertices.len() as u16;
+            if visible_back || visible_bottom || visible_right {
+                mesh.vertices
+                    .push(Vertex::new(x + 0.5, y - 0.5, z - 0.5, 1., 0., color));
+            }
+
+            let btr = mesh.vertices.len() as u16;
+            if visible_back || visible_top || visible_right {
+                mesh.vertices
+                    .push(Vertex::new(x + 0.5, y + 0.5, z - 0.5, 1., 1., color));
+            }
+
+            let btl = mesh.vertices.len() as u16;
+            if visible_back || visible_top || visible_left {
+                mesh.vertices
+                    .push(Vertex::new(x - 0.5, y + 0.5, z - 0.5, 0., 1., color));
+            }
+            if visible_front {
+                mesh.indices[FRONT].extend([fbl, fbr, ftr, fbl, ftr, ftl]);
+            }
+            if visible_back {
+                mesh.indices[BACK].extend([bbl, bbr, btr, bbl, btr, btl]);
+            }
+            if visible_top {
+                mesh.indices[TOP].extend([ftl, ftr, btr, ftl, btr, btl]);
+            }
+            if visible_bottom {
+                mesh.indices[BOTTOM].extend([bbl, bbr, fbr, bbl, fbr, fbl]);
+            }
+            if visible_left {
+                mesh.indices[LEFT].extend([bbl, fbl, ftl, bbl, ftl, btl]);
+            }
+            if visible_right {
+                mesh.indices[RIGHT].extend([bbr, fbr, ftr, bbr, ftr, btr]);
+            }
+        }
+        meshes.push(mesh);
+    }
+    meshes
+}
+
+pub fn draw_face_mesh_list(mesh_list: &[FaceMesh]) {
+    let gl = unsafe { get_internal_gl().quad_gl };
+    let mat = storage::get::<FlatMat>().0;
+    gl_use_material(mat);
+    for mesh in mesh_list {
+        for (idx, face_indices) in mesh.indices.iter().enumerate() {
+            let norm = match idx {
+                FRONT => Vec3::Z,
+                BACK => Vec3::NEG_Z,
+                TOP => Vec3::Y,
+                BOTTOM => Vec3::NEG_Y,
+                LEFT => Vec3::NEG_X,
+                RIGHT => Vec3::X,
+                _ => std::unreachable!(),
+            };
+            mat.set_uniform("face_normal", norm);
+            gl.texture(None);
+            gl.draw_mode(DrawMode::Triangles);
+            gl.geometry(&mesh.vertices[..], &face_indices[..]);
+        }
+    }
+    gl_use_default_material();
+}
+
+pub fn draw_scene_recursive(
+    meshes: &[Vec<FaceMesh>],
+    scene: &dot_vox::DotVoxData,
+    node_idx: u32,
+    parent: Option<u32>,
+    translation: IVec3,
+    rotation: dot_vox::Rotation,
+) {
+    let node = &scene.scenes[node_idx as usize];
+    let gl = unsafe { get_internal_gl().quad_gl };
+
+    match node {
+        SceneNode::Transform {
+            attributes: _,
+            frames,
+            child,
+            layer_id: _,
+        } => {
+            let mut this_translation = frames[0]
+                .position()
+                .map(|position| IVec3 {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                })
+                .unwrap_or(IVec3::ZERO);
+
+            let this_rotation = frames[0].orientation().unwrap_or(Rotation::IDENTITY);
+            let translation = translation + this_translation;
+            let rotation = rotation * this_rotation;
+
+            draw_scene_recursive(meshes, scene, *child, Some(node_idx), translation, rotation);
+        }
+
+        SceneNode::Group {
+            attributes: _,
+            children,
+        } => {
+            let mut translation = translation.as_vec3().xzy();
+            translation.z *= -1.0;
+
+            let (quat, scale) = rotation.to_quat_scale();
+            let quat = glam::Quat::from_array(quat);
+            let scale = -glam::Vec3::from_array(scale).xzy();
+
+            let size = Vec3::ZERO; // only apply centering on final translation!
+            let center = quat * size / 2.0;
+            let mat =
+                Mat4::from_scale_rotation_translation(scale, quat, translation - center * scale);
+            gl.push_model_matrix(mat);
+            for child in children {
+                draw_scene_recursive(
+                    meshes,
+                    scene,
+                    *child,
+                    Some(node_idx),
+                    IVec3::ZERO,
+                    Rotation::IDENTITY,
+                );
+            }
+            gl.pop_model_matrix();
+        }
+
+        SceneNode::Shape {
+            attributes: _,
+            models,
+        } => {
+            let mut translation = translation.as_vec3().xzy();
+            translation.z *= -1.0;
+
+            let (quat, scale) = rotation.to_quat_scale();
+            let quat = glam::Quat::from_array(quat);
+            let scale = -glam::Vec3::from_array(scale).xzy();
+
+            for model in models {
+                let idx = model.model_id;
+                let sz = scene.models[idx as usize].size;
+                let size = vec3(sz.x as f32, sz.z as f32, sz.y as f32);
+                let center = quat * size / 2.0;
+                let mat = Mat4::from_scale_rotation_translation(
+                    scale,
+                    quat,
+                    translation - center * scale,
+                );
+                gl.push_model_matrix(mat);
+                draw_face_mesh_list(&meshes[idx as usize]);
+                gl.pop_model_matrix();
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -157,7 +453,7 @@ enum Circuit {
     None,
     Wire,
     Head,
-    Tail
+    Tail,
 }
 
 #[derive(
@@ -206,13 +502,10 @@ enum Terrain {
 }
 
 fn to_screen(p: Vec3, camera: &Camera3D) -> Vec2 {
-    t!(p);
     let coord = camera.matrix().project_point3(p).xy() * vec2(1.0, -1.0);
-    t!(coord);
     let window = vec2(screen_width(), screen_height());
     let res = coord * window / 2. + window / 2.;
-    t!(res);
-    res 
+    res
 }
 
 /// Initial circuit state from a grid
@@ -240,17 +533,51 @@ fn window_conf() -> Conf {
     }
 }
 
+struct FlatMat(Material);
+
 #[macroquad::main(window_conf)]
 async fn main() {
     env_logger::init();
+    //set_cursor_grab(true);
 
     // CONFIGURATIONS
     let scroll_sens = 0.1;
     let pan_sens: f32 = 0.1;
+    let look_sens = 0.1;
 
     // MODELS
     let ship_vox = dot_vox::load("data/models/cargo-spaceship-by-fps-agency.vox").unwrap();
-    i!(ship_vox);
+    let ship_meshes: Vec<Vec<FaceMesh>> = ship_vox
+        .models
+        .iter()
+        .map(|m| {
+            let num = m.voxels.len();
+            i!(num);
+            gen_mesh(&m.voxels, &ship_vox.palette)
+        })
+        .collect();
+
+    storage::store(FlatMat(
+        load_material(
+            VERTEX,
+            FRAGMENT,
+            MaterialParams {
+                uniforms: vec![("face_normal".to_string(), UniformType::Float3)],
+                pipeline_params: PipelineParams {
+                    depth_test: Comparison::LessOrEqual,
+                    depth_write: true,
+                    color_blend: Some(BlendState::new(
+                        Equation::Add,
+                        BlendFactor::Value(BlendValue::SourceAlpha),
+                        BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+                    )),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    ));
 
     // EDITOR ELEMENTS
     let mut ship_files: Vec<_> = fs::read_dir("data/ships")
@@ -288,7 +615,21 @@ async fn main() {
     let map = Vec::<Terrain>::new();
 
     // INPUT ELEMENTS
-    let mut pos = vec2(grid.len() as f32 / 2., grid.len() as f32 / 2.);
+    let mut pos = vec3(0., 0., 0.);
+    let mut yaw: f32 = 1.18;
+    let mut pitch: f32 = 0.0;
+    let mut front = vec3(
+        yaw.cos() * pitch.cos(),
+        pitch.sin(),
+        yaw.sin() * pitch.cos(),
+    )
+    .normalize();
+    let mut right;
+    let mut fps_up = UP;
+    let mut last_mouse_pos: Vec2 = mouse_position().into();
+
+    let mut editor_pos = vec2(grid.len() as f32 / 2., grid.len() as f32 / 2.);
+
     let mut zoom = 1.0;
     let mut active_ship_file: usize = 0;
     let mut new_tile_type: ShipTile = tile_type_iter.next().unwrap();
@@ -297,28 +638,48 @@ async fn main() {
     let mut keybind_idx = 0;
     let mut state_count = 0;
 
-
     loop {
+        let frame_delta = get_frame_time();
+
         // PREPARE FRAME
         clear_background(DARKGRAY);
         let editor_camera = Camera3D {
-            position: vec3(pos.x, -15. * zoom, pos.y),
+            position: vec3(editor_pos.x, -15. * zoom, editor_pos.y),
             up: UP,
-            target: vec3(pos.x, 0., pos.y + 1.0),
-            render_target: Some(render_target(screen_width() as u32 / 2, screen_height() as u32 / 2)),
+            target: vec3(editor_pos.x, 0., editor_pos.y + 1.0),
+            render_target: Some(render_target(
+                screen_width() as u32 / 2,
+                screen_height() as u32 / 2,
+            )),
             ..Default::default()
         };
         let world_camera = Camera3D {
-            position: vec3(pos.x, -50. * zoom, pos.y),
-            up: UP,
-            target: vec3(pos.x + 5., 0., pos.y + 5.),
-            render_target: Some(render_target(screen_width() as u32, screen_height() as u32)),
+            position: pos,
+            up: fps_up,
+            target: pos + front,
+            // render_target: Some(render_target(screen_width() as u32, screen_height() as u32)),
             ..Default::default()
         };
 
         set_camera(&editor_camera);
 
         // USER INPUT
+        let mouse_delta: Vec2 = Vec2::from(mouse_position()) - last_mouse_pos;
+        last_mouse_pos = mouse_position().into();
+        if is_key_down(Space) {
+            yaw += -mouse_delta.x * frame_delta * look_sens;
+            pitch += mouse_delta.y * frame_delta * look_sens;
+            pitch = f32::clamp(pitch, -1.5, 1.5);
+        }
+        front = vec3(
+            yaw.cos() * pitch.cos(),
+            pitch.sin(),
+            yaw.sin() * pitch.cos(),
+        )
+        .normalize();
+        right = front.cross(UP).normalize();
+        fps_up = right.cross(front).normalize();
+
         let mouse_world: Vec2 = {
             // SOURCE: https://antongerdelan.net/opengl/raycasting.html
             let clip = (mouse_position_local() * vec2(1.0, -1.0))
@@ -359,16 +720,34 @@ async fn main() {
             _ => (),
         }
         if is_key_down(W) {
-            pos.y += pan_sens * zoom;
+            pos += front * pan_sens;
         }
         if is_key_down(A) {
-            pos.x -= pan_sens * zoom;
+            pos -= right * pan_sens;
         }
         if is_key_down(S) {
-            pos.y -= pan_sens * zoom;
+            pos -= front * pan_sens;
         }
         if is_key_down(D) {
-            pos.x += pan_sens * zoom;
+            pos += right * pan_sens;
+        }
+        if is_key_down(Q) {
+            pos.y -= pan_sens;
+        }
+        if is_key_down(Z) {
+            pos.y += pan_sens;
+        }
+        if is_key_down(KeyCode::Up) {
+            editor_pos.y += pan_sens * zoom;
+        }
+        if is_key_down(KeyCode::Down) {
+            editor_pos.y -= pan_sens * zoom;
+        }
+        if is_key_down(KeyCode::Right) {
+            editor_pos.x += pan_sens * zoom;
+        }
+        if is_key_down(KeyCode::Left) {
+            editor_pos.x -= pan_sens * zoom;
         }
 
         // INPUT SHIP EDITOR
@@ -432,7 +811,7 @@ async fn main() {
             for (y, tile) in col.iter_mut().enumerate() {
                 match tile {
                     ShipTile::Engine(dir, _) => {
-                        let v = dir.v(); 
+                        let v = dir.v();
                         let xb = x as isize - v.x as isize;
                         let yb = y as isize - v.y as isize;
                         let bounds = circuit_state_a.len() as isize;
@@ -445,17 +824,21 @@ async fn main() {
                                 *tile = ShipTile::Engine(dir.clone(), false);
                             }
                         }
-                    },
+                    }
 
-                    ShipTile::Input(key_idx) => if is_key_down(KEY_BINDS[*key_idx].0) && circuit_state_a[x][y] == Circuit::Wire {
-                        circuit_state_a[x][y] = Circuit::Head;
-                    },
+                    ShipTile::Input(key_idx) => {
+                        if is_key_down(KEY_BINDS[*key_idx].0)
+                            && circuit_state_a[x][y] == Circuit::Wire
+                        {
+                            circuit_state_a[x][y] = Circuit::Head;
+                        }
+                    }
                     _ => (),
                 }
             }
         }
 
-        // SIMULATE CIRCUIT 
+        // SIMULATE CIRCUIT
         if state_count == 0 {
             circuit_state_b = circuit_state_a.clone();
             for x in 0..circuit_state_b.len() {
@@ -474,7 +857,6 @@ async fn main() {
                                             if col[yn as usize] == Circuit::Head {
                                                 count += 1;
                                             }
-
                                         }
                                     }
                                 }
@@ -512,7 +894,6 @@ async fn main() {
                     Circuit::Tail => BLUE,
                 };
 
-
                 match tile {
                     ShipTile::Ground => (),
                     ShipTile::Wall => draw_cube(p, sz, None, GRAY),
@@ -527,16 +908,31 @@ async fn main() {
                         );
 
                         if *on {
-                            draw_sphere(p + p3d(dir.v()) * GRID_SCALE, GRID_SCALE / 8., None, ORANGE);
-                            draw_sphere(p + p3d(dir.v()) * 2. * GRID_SCALE, GRID_SCALE / 12., None, ORANGE);
-                            draw_sphere(p + p3d(dir.v()) * 3. * GRID_SCALE, GRID_SCALE / 16., None, ORANGE);
+                            draw_sphere(
+                                p + p3d(dir.v()) * GRID_SCALE,
+                                GRID_SCALE / 8.,
+                                None,
+                                ORANGE,
+                            );
+                            draw_sphere(
+                                p + p3d(dir.v()) * 2. * GRID_SCALE,
+                                GRID_SCALE / 12.,
+                                None,
+                                ORANGE,
+                            );
+                            draw_sphere(
+                                p + p3d(dir.v()) * 3. * GRID_SCALE,
+                                GRID_SCALE / 16.,
+                                None,
+                                ORANGE,
+                            );
                         }
                     }
                     ShipTile::Wire => {
                         draw_cube(p, sz / 4., None, color);
                     }
-                    ShipTile::Input(key_idx) => {
-                        let screen_p = to_screen(p, &editor_camera);
+                    ShipTile::Input(_key_idx) => {
+                        let _screen_p = to_screen(p, &editor_camera);
                         draw_cube(p, sz / 4., None, color);
                     }
                 }
@@ -545,33 +941,20 @@ async fn main() {
 
         // DRAW WORLD
         set_camera(&world_camera);
-        let gl = unsafe { get_internal_gl().quad_gl };
         draw_grid(GRID_SLICES as u32, GRID_SCALE, BLACK, GRAY);
-        let scale = vec3(0.1, -0.1, 0.1);
-        let rotation = Quat::from_axis_angle(UP, 90.);
-        let translation = vec3(100., 0., 100.);
-        let ship_model_transform = Mat4::from_scale_rotation_translation(scale, rotation, translation);
-        gl.push_model_matrix(ship_model_transform);
-        let mut t = 0.0;
-        for model in ship_vox.models.iter() {
-            let component_transform = Mat4::from_translation(vec3(t,0.,0.));
-            gl.push_model_matrix(component_transform);
-            for voxel in model.voxels.iter() {
-                let p = vec3(voxel.x as f32, voxel.y as f32, voxel.z as f32);
-                let sz = vec3(1.1, 1.1, 1.1);
-                let c = &ship_vox.palette[voxel.i as usize];
-                draw_cube(p, sz, None, Color::from_rgba(c.r, c.g, c.b, 254));
-            }
-            t += 50.;
-            gl.pop_model_matrix();
-        }
-        gl.pop_model_matrix();
+        draw_scene_recursive(
+            &ship_meshes,
+            &ship_vox,
+            0,
+            None,
+            IVec3::ZERO,
+            Rotation::IDENTITY,
+        );
 
         // DRAW UI
         set_default_camera();
         {
-            draw_target(&editor_camera, vec2(screen_width() / 2., 0.)); 
-            draw_target(&world_camera, vec2(0., 0.)); 
+            draw_target(&editor_camera, vec2(screen_width() / 2., 0.));
             let mut anchor = Vec2::ZERO;
             draw_info_line(&mut anchor, format!("fps: {}", get_fps()).as_str());
             let ship_name = ship_files[active_ship_file].as_path().display();

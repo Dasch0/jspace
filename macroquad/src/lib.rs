@@ -138,7 +138,7 @@ pub mod logging {
 }
 #[cfg(feature = "log-rs")]
 // Use logging facade
-pub use ::log as logging;
+pub use log as logging;
 pub use miniquad;
 
 use crate::{
@@ -149,7 +149,7 @@ use crate::{
 
 use glam::{vec2, Mat4, Vec2};
 
-struct Context {
+pub struct Context {
     audio_context: audio::AudioContext,
 
     screen_width: f32,
@@ -176,7 +176,7 @@ struct Context {
 
     input_events: Vec<Vec<MiniquadInputEvent>>,
 
-    gl: QuadGl,
+    pub gl: QuadGl,
     camera_matrix: Option<Mat4>,
 
     ui_context: UiContext,
@@ -418,7 +418,7 @@ pub mod test {
     pub static ONCE: std::sync::Once = std::sync::Once::new();
 }
 
-fn get_context() -> &'static mut Context {
+pub fn get_context() -> &'static mut Context {
     unsafe { CONTEXT.as_mut().unwrap_or_else(|| panic!()) }
 }
 

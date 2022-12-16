@@ -12,6 +12,16 @@ pub struct Vertex {
     pub color: Color,
 }
 
+impl Vertex {
+    pub fn new(x: f32, y: f32, z: f32, u: f32, v: f32, color: Color) -> Vertex {
+        Vertex {
+            position: vec3(x, y, z),
+            uv: vec2(u, v),
+            color,
+        }
+    }
+}
+
 impl From<Vertex> for crate::quad_gl::VertexInterop {
     fn from(vertex: Vertex) -> crate::quad_gl::VertexInterop {
         (
@@ -22,6 +32,7 @@ impl From<Vertex> for crate::quad_gl::VertexInterop {
     }
 }
 
+#[derive(Debug)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u16>,
@@ -81,7 +92,6 @@ pub fn draw_line_3d(start: Vec3, end: Vec3, color: Color) {
     context.gl.geometry(&line[..], &indices);
 }
 
-
 /// Draw a grid centered at (slices / 2, 0, slices / 2)
 pub fn draw_grid(slices: u32, spacing: f32, axes_color: Color, other_color: Color) {
     let half_slices = (slices as i32) / 2;
@@ -90,13 +100,29 @@ pub fn draw_grid(slices: u32, spacing: f32, axes_color: Color, other_color: Colo
         let color = if i == 0 { axes_color } else { other_color };
 
         draw_line_3d(
-            vec3(i as f32 * spacing + offset, 0., -half_slices as f32 * spacing + offset),
-            vec3(i as f32 * spacing + offset, 0., half_slices as f32 * spacing + offset),
+            vec3(
+                i as f32 * spacing + offset,
+                0.,
+                -half_slices as f32 * spacing + offset,
+            ),
+            vec3(
+                i as f32 * spacing + offset,
+                0.,
+                half_slices as f32 * spacing + offset,
+            ),
             color,
         );
         draw_line_3d(
-            vec3(-half_slices as f32 * spacing + offset, 0., i as f32 * spacing + offset),
-            vec3(half_slices as f32 * spacing + offset, 0., i as f32 * spacing + offset),
+            vec3(
+                -half_slices as f32 * spacing + offset,
+                0.,
+                i as f32 * spacing + offset,
+            ),
+            vec3(
+                half_slices as f32 * spacing + offset,
+                0.,
+                i as f32 * spacing + offset,
+            ),
             color,
         );
     }
